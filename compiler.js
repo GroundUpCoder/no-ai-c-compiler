@@ -581,6 +581,8 @@
    *  value?: string | number
    *  line: number
    * }} Token
+   * 
+   * @typedef {Token["type"]} TokenType
    */
 
   /**
@@ -708,6 +710,92 @@
 
   // #endregion
 
+  // #region PARSER
+
+  /**
+   * @param {Token[]} tokens
+   * @returns {Uint8Array} wasm bytes
+   */
+  function parseTokens(tokens) {
+    const ts = tokens;
+    const n = ts.length;
+    let i = 0;
+
+    function at(tokenType, offset = 0) {
+      return ts[i + offset]?.type === tokenType;
+    }
+
+    function consume(tokenType) {
+      if (ts[i]?.type === tokenType) {
+        return ts[i++];
+      }
+    }
+
+    /** @param {TokenType} tokenType */
+    function expect(tokenType) {
+      const token = consume(tokenType);
+      if (!token) throw new Error(`Expected ${tokenType} but got ${token?.type}`);
+      return token;
+    }
+
+    return emit(b => {
+      const { CODE } = b;
+
+      let activeFunc = null;
+
+
+      function parsePrimaryExpression() {
+        const value = expect("INT").value;
+        activeFunc.code.push(CODE.i32.const(value));
+      }
+
+      function parseExpression() {
+        parsePrimaryExpression();
+        while (consume("+")) {
+          parsePrimaryExpression();
+          activeFunc.code.push(CODE.i32.add);
+        }
+      }
+
+      function parseStatement() {
+        if (consume("{")) { // compound
+          while (!consume("}")) {
+            parseStatement();
+          }
+        } else if (consume("return")) {
+          parseExpression();
+          expect(";");
+          activeFunc.code.push(CODE.ret);
+        } else {
+          parseExpression();
+          expect(";");
+        }
+      }
+
+      function parseFunction() {
+        expect("int"); // TODO: return types
+        const functionName = expect("IDENT").value;
+        const wfunc = b.newFunc();
+        wfunc.export = functionName;
+        activeFunc = wfunc;
+        wfunc.code = [];
+        expect("("); // TODO: parameters
+        expect(")");
+        parseStatement();
+      }
+
+      function parseTranslationUnit() {
+        while (i < n) {
+          parseFunction();
+        }
+      }
+
+      parseTranslationUnit();
+    });
+  }
+
+  // #endregion PARSER
+
   // // #region WASM TESTS
   // const wasmBytes = emit(b => {
   //   const { CODE } = b;
@@ -795,16 +883,43 @@
 
   // // #endregion WASM TESTS
 
-  // #region TOKENIZER TESTS
+  // // #region TOKENIZER TESTS
 
-  const tokens = tokenize(`
-    int foo(float bar) {
-      const char *str = "hello world\\n";
-    }
-    int main() { return 123; }
-  `);
-  console.log(`tokens`, tokens);
+  // const tokens = tokenize(`
+  //   int main() { return 123; }
+  // `);
+  // console.log(`tokens`, tokens);
 
-  // #endregion TOKENIZER TESTS
+  // // #endregion TOKENIZER TESTS
+
+  // #region PARSER TESTS
+  {
+    const tokens = tokenize(`
+      int main() { return 2 + 5; }
+    `);
+    console.log(`tokens`, tokens);
+    const wasmBytes = parseTokens(tokens);
+    WebAssembly.instantiate(wasmBytes, {
+      c: {
+        puti(x) {
+          console.log(x);
+        },
+        putd(x) {
+          console.log(x);
+        },
+      },
+    })
+      .then(({ instance }) => {
+        const { exports } = instance;
+        if (exports.main) {
+          const returnValue = exports.main();
+          console.log('main returned', returnValue);
+        } else {
+          console.log('no main function found');
+        }
+      })
+      .catch(e => console.log('error', e));
+  }
+  // #endregion PARSER TESTS
 
 })();
