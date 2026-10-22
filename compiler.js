@@ -109,6 +109,7 @@
         this.returnType = /** @type {WValType} */ ('i32');
         this.locals = /** @type {WLocal[]} */ ([]);
         this.export = /** @type {string | null} */ (null);
+        this.import = /** @type {[string, string] | null} */ (null);
       }
 
       /** @param {WValType} */
@@ -160,6 +161,26 @@
 
     f(builder);
 
+    {
+      const tempIds = new Map(wfuncs.map((f, i) => [f, i]));
+      wfuncs.sort((fa, fb) => {
+        if (fa.import && !fb.import) {
+          return -1; // fa < fb
+        }
+        if (!fa.import && fb.import) {
+          return 1; // fb < fa
+        }
+        ida = tempIds.get(fa);
+        idb = tempIds.get(fb);
+        return ida < idb ? -1 : idb < ida ? 1 : 0;
+      });
+    }
+
+    const wfuncsWithIds = wfuncs.map((f, i) => [f, i]);
+    const importFuncsWithIds = wfuncsWithIds.filter(([f, i]) => f.import);
+    const definedFuncsWithIds = wfuncsWithIds.filter(([f, i]) => !f.import);
+    const definedFuncs = definedFuncsWithIds.map(([f, i]) => f);
+
     const typeSection = emitSection(1, emitList([
       // this way, wasm functions map to their type id directly.
       ...wfuncs.map(f => [
@@ -169,13 +190,26 @@
       ]),
     ]));
 
-    const functionSection = emitSection(3, emitList([
-      ...wfuncs.map((f, i) => i),
+    const importSection = emitSection(2, emitList([
+      ...importFuncsWithIds.map(([f, i]) => {
+        const [moduleName, itemName] = f.import;
+        return [
+          emitName(moduleName),
+          emitName(itemName),
+          0x00, lebu(i),
+        ];
+      }),
     ]));
 
+    const functionSection = emitSection(3, emitList([
+      ...definedFuncsWithIds
+        .map(([f, i]) => { return lebu(i); }),
+    ]));
+
+    console.log('functionSection', functionSection);
+
     const exportSection = emitSection(7, emitList([
-      ...wfuncs.map((f, i) => {
-        if (!f.export) return [];
+      ...wfuncsWithIds.filter(([f, i]) => f.export).map(([f, i]) => {
         return [
           emitName(f.export),
           0x00, lebu(i),
@@ -184,7 +218,7 @@
     ]));
 
     const codeSection = emitSection(10, emitList([
-      ...wfuncs.map(f => {
+      ...definedFuncs.map(f => {
         const locals = emitList([
           ...f.locals.slice(f.parameters.length).map(p =>
             [lebu(1), WVAL_ENCODING_MAP[p.type]]),
@@ -204,18 +238,28 @@
       0x00, 0x61, 0x73, 0x6D, // magic
       0x01, 0x00, 0x00, 0x00, // version
       // sections
-      ...typeSection,
-      ...functionSection,
-      ...exportSection,
-      ...codeSection,
+      ...typeSection, // 1
+      ...importSection, // 2
+      ...functionSection, // 3
+      ...exportSection, // 7
+      ...codeSection, // 10
     ].flat(Infinity));
   }
 
   const wasmBytes = emit(b => {
+    const puti = b.newFunc();
+    puti.import = ["c", "puti"];
+
     const func = b.newFunc();
     func.export = "someFunc";
   });
-  WebAssembly.instantiate(wasmBytes, {})
+  WebAssembly.instantiate(wasmBytes, {
+    c: {
+      puti(x) {
+        console.log(x);
+      },
+    },
+  })
     .then(({ instance }) => {
       const { exports } = instance;
       console.log(exports.someFunc());
