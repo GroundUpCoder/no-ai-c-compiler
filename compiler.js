@@ -138,13 +138,17 @@
      * } | {
      *  kind: "tee",
      *  variable: WVariable,
+     * } | {
+     *  kind: "call",
+     *  func: WFunc,
      * }} Opcode
      */
 
     class WFunc {
       constructor() {
+        this.funcidx = -1;
         this.parameters = /** @type {WLocal[]} */ ([]);
-        this.returnType = /** @type {WValType} */ ('i32');
+        this.returnType = I32; // 'void' will use i32 instead of empty return type
         this.export = /** @type {string | null} */ (null);
         this.import = /** @type {[string, string] | null} */ (null);
         this.code = /** @type {Opcode[] | null} */ (null);
@@ -154,6 +158,7 @@
       newParameter(type) {
         const parameter = this.newLocal(type);
         this.parameters.push(parameter);
+        return parameter;
       }
 
       /** @param {WValType} */
@@ -176,9 +181,15 @@
       loop(body) {
         return [0x03, 0x40, body, 0x0B];
       },
+      call(func) {
+        return /** @type {Opcode} */ ({ kind: "call", func });
+      },
 
       // variable
       get(variable) {
+        if (!(variable instanceof WVariable)) {
+          throw new Error(`CODE.get(${variable})`);
+        }
         return /** @type {Opcode} */ ({ kind: "get", variable });
       },
       set(variable) {
@@ -188,28 +199,136 @@
         return /** @type {Opcode} */ ({ kind: "tee", variable });
       },
 
+      get add() {
+        throw new Error(`CODE.add is invalid, do CODE.i32.add, etc`);
+      },
+
       // numeric
       i32: {
         const(value) {
           return [0x41, lebI32(value)];
         },
 
+        eqz: 0x45,
+        eq: 0x46,
+        ne: 0x47,
+        lt_s: 0x48,
+        lt_u: 0x49,
+        gt_s: 0x4A,
+        gt_u: 0x4B,
+        le_s: 0x4C,
+        le_u: 0x4D,
+        ge_s: 0x4E,
+        ge_u: 0x4F,
+
+        clz: 0x67,
+        ctz: 0x68,
+        popcnt: 0x69,
         add: 0x6A,
+        sub: 0x6B,
+        mul: 0x6C,
+        div_s: 0x6D,
+        div_u: 0x6E,
+        rem_s: 0x6F,
+        rem_u: 0x70,
+        and: 0x71,
+        or: 0x72,
+        xor: 0x73,
+        shl: 0x74,
+        shr_s: 0x75,
+        shr_u: 0x76,
+        rotl: 0x77,
+        rotr: 0x78,
       },
       i64: {
         const(value) {
           return [0x42, lebI64(value)];
         },
+
+        eqz: 0x50,
+        eq: 0x51,
+        ne: 0x52,
+        lt_s: 0x53,
+        lt_u: 0x54,
+        gt_s: 0x55,
+        gt_u: 0x56,
+        le_s: 0x57,
+        le_u: 0x58,
+        ge_s: 0x59,
+        ge_u: 0x5A,
+
+        clz: 0x79,
+        ctz: 0x7A,
+        popcnt: 0x7B,
+        add: 0x7C,
+        sub: 0x7D,
+        mul: 0x7E,
+        div_s: 0x7F,
+        div_u: 0x80,
+        rem_s: 0x81,
+        rem_u: 0x82,
+        and: 0x83,
+        or: 0x84,
+        xor: 0x85,
+        shl: 0x86,
+        shr_s: 0x87,
+        shr_u: 0x88,
+        rotl: 0x89,
+        rotr: 0x8A,
       },
       f32: {
         const(value) {
           return [0x43, emitF32(value)];
         },
+
+        eq: 0x5B,
+        ne: 0x5C,
+        lt: 0x5D,
+        gt: 0x5E,
+        le: 0x5F,
+        ge: 0x60,
+
+        abs: 0x8B,
+        neg: 0x8C,
+        ceil: 0x8D,
+        floor: 0x8E,
+        trunc: 0x8F,
+        nearest: 0x90,
+        sqrt: 0x91,
+        add: 0x92,
+        sub: 0x93,
+        mul: 0x94,
+        div: 0x95,
+        min: 0x96,
+        max: 0x97,
+        copysign: 0x98,
       },
       f64: {
         const(value) {
           return [0x44, emitF64(value)];
-        }
+        },
+
+        eq: 0x61,
+        ne: 0x62,
+        lt: 0x63,
+        gt: 0x64,
+        le: 0x65,
+        ge: 0x66,
+
+        abs: 0x99,
+        neg: 0x9A,
+        ceil: 0x9B,
+        floor: 0x9C,
+        trunc: 0x9D,
+        nearest: 0x9E,
+        sqrt: 0x9F,
+        add: 0xA0,
+        sub: 0xA1,
+        mul: 0xA2,
+        div: 0xA3,
+        min: 0xA4,
+        max: 0xA5,
+        copysign: 0xA6,
       },
 
       /** @param {WValType} type */
@@ -257,16 +376,15 @@
         if (!fa.import && fb.import) {
           return 1; // fb < fa
         }
-        ida = tempIds.get(fa);
-        idb = tempIds.get(fb);
+        const ida = tempIds.get(fa);
+        const idb = tempIds.get(fb);
         return ida < idb ? -1 : idb < ida ? 1 : 0;
       });
     }
 
-    const wfuncsWithIds = wfuncs.map((f, i) => pairOf(f, i));
-    const importFuncsWithIds = wfuncsWithIds.filter(([f, i]) => f.import);
-    const definedFuncsWithIds = wfuncsWithIds.filter(([f, i]) => !f.import);
-    const definedFuncs = definedFuncsWithIds.map(([f, i]) => f);
+    wfuncs.forEach((f, i) => f.funcidx = i);
+    const importFuncs = wfuncs.filter(f => f.import);
+    const definedFuncs = wfuncs.filter(f => !f.import);
 
     const typeSection = emitSection(1, emitList([
       // this way, wasm functions map to their type id directly.
@@ -278,19 +396,18 @@
     ]));
 
     const importSection = emitSection(2, emitList([
-      ...importFuncsWithIds.map(([f, i]) => {
+      ...importFuncs.map(f => {
         const [moduleName, itemName] = f.import;
         return [
           emitName(moduleName),
           emitName(itemName),
-          0x00, lebu(i),
+          0x00, lebu(f.funcidx),
         ];
       }),
     ]));
 
     const functionSection = emitSection(3, emitList([
-      ...definedFuncsWithIds
-        .map(([f, i]) => { return lebu(i); }),
+      ...definedFuncs.map(f => lebu(f.funcidx)),
     ]));
 
     const globalSection = emitSection(6, emitList([
@@ -302,10 +419,10 @@
     ]));
 
     const exportSection = emitSection(7, emitList([
-      ...wfuncsWithIds.filter(([f, i]) => f.export).map(([f, i]) => {
+      ...wfuncs.filter(f => f.export).map(f => {
         return [
           emitName(f.export),
-          0x00, lebu(i),
+          0x00, lebu(f.funcidx),
         ];
       }),
     ]));
@@ -314,6 +431,8 @@
       ...definedFuncs.map(f => {
 
         const flatCode = f.code.flat(Infinity);
+
+        f.parameters.forEach((p, i) => p.slotId = i);
 
         const locals = /** @type {WLocal[]} */ ([]);
         {
@@ -349,7 +468,7 @@
           });
 
           // Assign the final slot ids for each local variable.
-          locals.forEach((v, i) => v.slotId = i);
+          locals.forEach((v, i) => v.slotId = f.parameters.length + i);
         }
 
         // TODO: actually group the declarations so that it's per-type
@@ -385,9 +504,15 @@
               if (variable.slotId < 0) {
                 throw new Error(
                   `Variable used before slot assigned ${
-                    JSON.stringify(variable)}`);
+                    JSON.stringify(variable)} (${
+                      variable.constructor.name})`);
               }
-              reifiedCode.push(code, variable.slotId);
+              reifiedCode.push(code, lebu(variable.slotId));
+              break;
+            }
+            case "call": {
+              const func = /** @type {WFunc} */ (item.func);
+              reifiedCode.push(0x10, lebu(func.funcidx));
               break;
             }
             default:
@@ -423,13 +548,49 @@
     const globalA = b.newGlobal(I32);
 
     const puti = b.newFunc();
+    puti.newParameter(I32);
     puti.import = ["c", "puti"];
 
-    const func = b.newFunc();
+    const putd = b.newFunc();
+    putd.newParameter(F64);
+    putd.import = ["c", "putd"];
+
+    const func2 = b.newFunc();
     {
-      const localA = func.newLocal(I32);
-      func.export = "main";
-      func.code = [
+      const param1 = func2.newParameter(I32);
+      func2.code = [
+
+        // puti(param1 + 1);
+        CODE.get(param1),
+        CODE.i32.const(2),
+        CODE.i32.add,
+        CODE.call(puti),
+        CODE.drop,
+
+        CODE.i32.const(0), CODE.ret, // return 0
+      ];
+    }
+
+    const main = b.newFunc();
+    {
+      const localA = main.newLocal(I32);
+      main.export = "main";
+      main.code = [
+
+        // func2(15);
+        CODE.i32.const(15),
+        CODE.call(func2),
+
+        CODE.f64.const(7.5),
+        CODE.f64.const(7.5),
+        CODE.f64.mul,
+        CODE.call(putd),
+        CODE.drop,
+
+        CODE.i32.const(888),
+        CODE.call(puti),
+        CODE.drop,
+
         CODE.i32.const(777), // A = 777
         // CODE.tee(localA),
         CODE.set(globalA),
@@ -447,6 +608,9 @@
   WebAssembly.instantiate(wasmBytes, {
     c: {
       puti(x) {
+        console.log(x);
+      },
+      putd(x) {
         console.log(x);
       },
     },
