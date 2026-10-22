@@ -1,6 +1,8 @@
 (() => {
   "use strict";
 
+  // #region WASM
+
   /**
    * @template {*} A
    * @template {*} B
@@ -542,87 +544,267 @@
     ].flat(Infinity));
   }
 
-  const wasmBytes = emit(b => {
-    const { CODE } = b;
+  // #endregion WASM
 
-    const globalA = b.newGlobal(I32);
+  // #region TOKENIZER
 
-    const puti = b.newFunc();
-    puti.newParameter(I32);
-    puti.import = ["c", "puti"];
+  const KEYWORDS = /** @type {const} */ ([
+    "auto", "extern", "short", "while", "break",
+    "float", "signed", "_Alignas", "case", "for",
+    "sizeof", "_Alignof", "char", "goto", "static",
+    "_Atomic", "const", "if", "struct", "_Bool", "continue",
+    "inline", "switch", "_Complex", "default", "int",
+    "typedef", "_Generic", "do", "long", "union", "_Imaginary",
+    "double", "register", "unsigned", "_Noreturn", "else",
+    "restrict", "void", "_Static_assert", "enum", "return",
+    "volatile", "_Thread_local",
+  ]);
 
-    const putd = b.newFunc();
-    putd.newParameter(F64);
-    putd.import = ["c", "putd"];
+  const KEYWORD_SET = new Set(KEYWORDS);
 
-    const func2 = b.newFunc();
-    {
-      const param1 = func2.newParameter(I32);
-      func2.code = [
+  const PUNCTUATORS = /** @type {const} */ ([
+    "[", "]", "(", ")", "{", "}", ".", "->",
+    "++", "--", "&", "*", "+", "-", "~", "!",
+    "/", "%", "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "^", "|", "&&", "||",
+    "?", ":", ";", "...",
+    "=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|=",
+    ",",
+  ]);
 
-        // puti(param1 + 1);
-        CODE.get(param1),
-        CODE.i32.const(2),
-        CODE.i32.add,
-        CODE.call(puti),
-        CODE.drop,
+  const REVERSE_SORTED_PUNCTUATORS = PUNCTUATORS.toSorted().reverse();
 
-        CODE.i32.const(0), CODE.ret, // return 0
-      ];
-    }
+  /**
+   * @typedef {{
+   *  type: typeof KEYWORDS[number] |
+   *    "IDENT" | "INT" | "DOUBLE" | "STR" |
+   *    typeof PUNCTUATORS[number]
+   *  value?: string | number
+   *  line: number
+   * }} Token
+   */
 
-    const main = b.newFunc();
-    {
-      const localA = main.newLocal(I32);
-      main.export = "main";
-      main.code = [
+  /**
+   * @param {string} source
+   * @returns {Token[]}
+   */
+  function tokenize(source) {
+    const s = source;
+    const n = s.length;
+    let i = 0, line = 1;
+    const tokens = /** @type {Token[]} */ ([]);
 
-        // func2(15);
-        CODE.i32.const(15),
-        CODE.call(func2),
+    const isspace = c => (typeof c === 'string' && " \f\n\r\t\v".includes(c));
+    const isdigit = c => (typeof c === 'string' && /[0-9]/.test(c));
+    const isident = c => (typeof c === 'string' && /[a-z0-9A-Z_]/.test(c));
 
-        CODE.f64.const(7.5),
-        CODE.f64.const(7.5),
-        CODE.f64.mul,
-        CODE.call(putd),
-        CODE.drop,
-
-        CODE.i32.const(888),
-        CODE.call(puti),
-        CODE.drop,
-
-        CODE.i32.const(777), // A = 777
-        // CODE.tee(localA),
-        CODE.set(globalA),
-        CODE.get(globalA), // A + A
-        CODE.get(globalA),
-        CODE.i32.add,
-
-        // CODE.i32.const(555),
-        // CODE.i32.const(47),
-        // CODE.i32.add,
-        CODE.ret,
-      ];
-    }
-  });
-  WebAssembly.instantiate(wasmBytes, {
-    c: {
-      puti(x) {
-        console.log(x);
-      },
-      putd(x) {
-        console.log(x);
-      },
-    },
-  })
-    .then(({ instance }) => {
-      const { exports } = instance;
-      if (exports.main) {
-        const returnValue = exports.main();
-        console.log('main returned', returnValue);
-      } else {
-        console.log('no main function found');
+    nextToken: while (i < n) {
+      // Skip spaces and comments
+      if (isspace(s[i])) {
+        if (s[i] === '\n') line++;
+        i++;
+        continue;
       }
-    })
-    .catch(e => console.log('error', e));
+      if (s.startsWith("//", i)) {
+        while (i < n && s[i] !== '\n') i++;
+        continue;
+      }
+      if (s.startsWith("/*", i)) {
+        i += 2;
+        while (!s.startsWith("*/", i)) {
+          if (s[i] === '\n') line++;
+          i++;
+        }
+        i += 2;
+        continue;
+      }
+
+      const j = i; // start of next token
+
+      // keywords and identifiers
+      if (!isdigit(s[i]) && isident(s[i])) {
+        while (isident(s[i])) i++;
+        const value = s.slice(j, i);
+        if (KEYWORD_SET.has(value)) {
+          tokens.push({ type: value, line });
+        } else {
+          tokens.push({ type: "IDENT", value, line });
+        }
+        continue nextToken;
+      }
+
+      // constants
+      // integers
+      if (isdigit(s[i]) || (s[i] === '.' && isdigit(s[i + 1]))) {
+        let radix = 10;
+        let start = j;
+        if (s.startsWith("0x", i)) {
+          i += 2;
+          start += i;
+          radix = 16;
+        }
+        while (isdigit(s[i])) i++;
+        if (s[i] === '.') {
+          i++;
+          while (isdigit(s[i])) i++;
+          const value = parseFloat(s.slice(start, i));
+          tokens.push({ type: "DOUBLE", value, line });
+          continue nextToken;
+        }
+        const value = parseInt(s.slice(start, i), radix);
+        tokens.push({ type: "INT", value, line });
+        continue nextToken;
+      }
+
+      // string literals
+      if (s[i] === '"') {
+        let value = '';
+        i++;
+        while (i < n && s[i] !== '"') {
+          if (s[i] === '\\') {
+            i++;
+            switch (s[i]) {
+              case "\\":
+              case "'":
+              case '"': value += s[i]; i++; break;
+              case 'f': value += '\f'; i++; break;
+              case 'n': value += '\n'; i++; break;
+              case 'r': value += '\r'; i++; break;
+              case 't': value += '\t'; i++; break;
+              case 'v': value += '\v'; i++; break;
+              default:
+                throw new Error(`Invalid or unsupported string escape ${
+                  JSON.stringify(s[i])} on line ${line}`);
+            }
+          } else if (s[i] === '\n') {
+            throw new Error(
+              `Unterminated string literal on line ${line} (newline encountered)`);
+          } else value += s[i++]; // TODO: consider if this is ok with UTF-16
+        }
+        if (s[i] !== '"') {
+          throw new Error(`Unterminated string literal on line ${line}`);
+        }
+        i++; // closing quote
+        tokens.push({ type: "STR", value, line });
+        continue nextToken;
+      }
+
+      // punctuator
+      for (const punct of REVERSE_SORTED_PUNCTUATORS) {
+        if (s.startsWith(punct, i)) {
+          tokens.push({ type: punct, line });
+          i += punct.length;
+          continue nextToken;
+        }
+      }
+
+      // TODO: emit error token instead of throwing
+      // Unrecognized token
+      while (!isspace(s[i])) i++;
+      throw new Error(`Unrecognized token ${s.slice(j, i)} on line ${line}`);
+    }
+
+    return tokens;
+  }
+
+  // #endregion
+
+  // // #region WASM TESTS
+  // const wasmBytes = emit(b => {
+  //   const { CODE } = b;
+
+  //   const globalA = b.newGlobal(I32);
+
+  //   const puti = b.newFunc();
+  //   puti.newParameter(I32);
+  //   puti.import = ["c", "puti"];
+
+  //   const putd = b.newFunc();
+  //   putd.newParameter(F64);
+  //   putd.import = ["c", "putd"];
+
+  //   const func2 = b.newFunc();
+  //   {
+  //     const param1 = func2.newParameter(I32);
+  //     func2.code = [
+
+  //       // puti(param1 + 1);
+  //       CODE.get(param1),
+  //       CODE.i32.const(2),
+  //       CODE.i32.add,
+  //       CODE.call(puti),
+  //       CODE.drop,
+
+  //       CODE.i32.const(0), CODE.ret, // return 0
+  //     ];
+  //   }
+
+  //   const main = b.newFunc();
+  //   {
+  //     const localA = main.newLocal(I32);
+  //     main.export = "main";
+  //     main.code = [
+
+  //       // func2(15);
+  //       CODE.i32.const(15),
+  //       CODE.call(func2),
+
+  //       CODE.f64.const(7.5),
+  //       CODE.f64.const(7.5),
+  //       CODE.f64.mul,
+  //       CODE.call(putd),
+  //       CODE.drop,
+
+  //       CODE.i32.const(888),
+  //       CODE.call(puti),
+  //       CODE.drop,
+
+  //       CODE.i32.const(777), // A = 777
+  //       // CODE.tee(localA),
+  //       CODE.set(globalA),
+  //       CODE.get(globalA), // A + A
+  //       CODE.get(globalA),
+  //       CODE.i32.add,
+
+  //       // CODE.i32.const(555),
+  //       // CODE.i32.const(47),
+  //       // CODE.i32.add,
+  //       CODE.ret,
+  //     ];
+  //   }
+  // });
+  // WebAssembly.instantiate(wasmBytes, {
+  //   c: {
+  //     puti(x) {
+  //       console.log(x);
+  //     },
+  //     putd(x) {
+  //       console.log(x);
+  //     },
+  //   },
+  // })
+  //   .then(({ instance }) => {
+  //     const { exports } = instance;
+  //     if (exports.main) {
+  //       const returnValue = exports.main();
+  //       console.log('main returned', returnValue);
+  //     } else {
+  //       console.log('no main function found');
+  //     }
+  //   })
+  //   .catch(e => console.log('error', e));
+
+  // // #endregion WASM TESTS
+
+  // #region TOKENIZER TESTS
+
+  const tokens = tokenize(`
+    int foo(float bar) {
+      const char *str = "hello world\\n";
+    }
+    int main() { return 123; }
+  `);
+  console.log(`tokens`, tokens);
+
+  // #endregion TOKENIZER TESTS
+
 })();
