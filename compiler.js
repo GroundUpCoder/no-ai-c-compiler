@@ -1,5 +1,16 @@
 (() => {
   "use strict";
+
+  /**
+   * @template {*} A
+   * @template {*} B
+   * @param {A} a 
+   * @param {B} b 
+   * @returns {[A, B]}
+   */
+  function pairOf(a, b) {
+    return [a, b];
+  }
   
   function lebu(x) {
     const CONTINUE_BIT = 0b10000000;
@@ -34,6 +45,10 @@
 
   function lebI32(x) {
     return lebs(BigInt.asIntN(32, BigInt(x)));
+  }
+
+  function lebI64(x) {
+    return lebs(BigInt.asIntN(64, BigInt(x)));
   }
 
   const _f32arr = new Float32Array(1);
@@ -97,19 +112,42 @@
     class WVariable {
       /** @param {WValType} type */
       constructor(type) {
+        if (!type) {
+          throw new Error(`WVariable(type=${type})`);
+        }
         this.type = type;
+        this.slotId = -1;
       }
     }
-    class WGlobal extends WVariable {}
+    let _nextGlobalSlotId = 0;
+    class WGlobal extends WVariable {
+      constructor(type) {
+        super(type);
+        this.slotId = _nextGlobalSlotId++;
+      }
+    }
     class WLocal extends WVariable {}
+
+    /**
+     * @typedef {number | {
+     *  kind: "get",
+     *  variable: WVariable,
+     * } | {
+     *  kind: "set",
+     *  variable: WVariable,
+     * } | {
+     *  kind: "tee",
+     *  variable: WVariable,
+     * }} Opcode
+     */
 
     class WFunc {
       constructor() {
         this.parameters = /** @type {WLocal[]} */ ([]);
         this.returnType = /** @type {WValType} */ ('i32');
-        this.locals = /** @type {WLocal[]} */ ([]);
         this.export = /** @type {string | null} */ (null);
         this.import = /** @type {[string, string] | null} */ (null);
+        this.code = /** @type {Opcode[] | null} */ (null);
       }
 
       /** @param {WValType} */
@@ -120,9 +158,8 @@
 
       /** @param {WValType} */
       newLocal(type) {
-        const localvar = new WLocal(type);
-        this.locals.push(localvar);
-        return localvar;
+        if (!type) throw new Error(`newLocal(${type})`);
+        return new WLocal(type);
       }
     }
 
@@ -140,22 +177,72 @@
         return [0x03, 0x40, body, 0x0B];
       },
 
+      // variable
+      get(variable) {
+        return /** @type {Opcode} */ ({ kind: "get", variable });
+      },
+      set(variable) {
+        return /** @type {Opcode} */ ({ kind: "set", variable });
+      },
+      tee(variable) {
+        return /** @type {Opcode} */ ({ kind: "tee", variable });
+      },
+
+      // numeric
       i32: {
         const(value) {
           return [0x41, lebI32(value)];
         },
+
+        add: 0x6A,
+      },
+      i64: {
+        const(value) {
+          return [0x42, lebI64(value)];
+        },
+      },
+      f32: {
+        const(value) {
+          return [0x43, emitF32(value)];
+        },
+      },
+      f64: {
+        const(value) {
+          return [0x44, emitF64(value)];
+        }
+      },
+
+      /** @param {WValType} type */
+      zeroForType(type) {
+        switch (type) {
+          case "f32": return CODE.f32.const(0);
+          case "f64": return CODE.f64.const(0);
+          case "i32": return CODE.i32.const(0);
+          case "i64": return CODE.i64.const(0);
+        }
+        throw new Error(`zeroForType(${type})`);
       },
 
       ret: 0x0F,
     });
 
     const wfuncs = /** @type {WFunc[]} */ ([]);
+    const wglobals = /** @type {WGlobal[]} */ ([]);
 
     const builder = /** @type {const} */ {
+      CODE,
+
       newFunc() {
         const func = new WFunc();
         wfuncs.push(func);
         return func;
+      },
+
+      /** @param {WValType} type */
+      newGlobal(type) {
+        const variable = new WGlobal(type);
+        wglobals.push(variable);
+        return variable;
       },
     };
 
@@ -176,7 +263,7 @@
       });
     }
 
-    const wfuncsWithIds = wfuncs.map((f, i) => [f, i]);
+    const wfuncsWithIds = wfuncs.map((f, i) => pairOf(f, i));
     const importFuncsWithIds = wfuncsWithIds.filter(([f, i]) => f.import);
     const definedFuncsWithIds = wfuncsWithIds.filter(([f, i]) => !f.import);
     const definedFuncs = definedFuncsWithIds.map(([f, i]) => f);
@@ -206,7 +293,13 @@
         .map(([f, i]) => { return lebu(i); }),
     ]));
 
-    console.log('functionSection', functionSection);
+    const globalSection = emitSection(6, emitList([
+      ...wglobals.map(g => [
+        WVAL_ENCODING_MAP[g.type], // global's type
+        0x01, // mutable
+        CODE.zeroForType(g.type), 0x0B, // expr
+      ]),
+    ]));
 
     const exportSection = emitSection(7, emitList([
       ...wfuncsWithIds.filter(([f, i]) => f.export).map(([f, i]) => {
@@ -219,16 +312,93 @@
 
     const codeSection = emitSection(10, emitList([
       ...definedFuncs.map(f => {
-        const locals = emitList([
-          ...f.locals.slice(f.parameters.length).map(p =>
-            [lebu(1), WVAL_ENCODING_MAP[p.type]]),
+
+        const flatCode = f.code.flat(Infinity);
+
+        const locals = /** @type {WLocal[]} */ ([]);
+        {
+          // collect all local variables inferred from code/body
+          // of the function itself
+          const seenVariables = new Set(f.parameters);
+          for (const item of flatCode) {
+            if (typeof item === 'number') continue;
+            switch (item.kind) {
+              case "get":
+              case "set":
+              case "tee": {
+                const variable = item.variable;
+                if (!(variable instanceof WLocal)) continue;
+                if (!seenVariables.has(variable)) {
+                  seenVariables.add(variable);
+                  locals.push(variable);
+                }
+              }
+            }
+          }
+
+          // temporary slotId assignments for tie breakers in the sort
+          locals.forEach((v, i) => v.slotId = i);
+
+          // sort the locals so that locals of the same type
+          // are right next to each other.
+          locals.sort((a, b) => {
+            if (a.type !== b.type) {
+              return a.type < b.type ? -1 : b.type < a.type ? 1 : 0;
+            }
+            return a.slotId - b.slotId;
+          });
+
+          // Assign the final slot ids for each local variable.
+          locals.forEach((v, i) => v.slotId = i);
+        }
+
+        // TODO: actually group the declarations so that it's per-type
+        // not per-slot.
+        const localsEncoded = emitList([
+          ...locals.map(v => [lebu(1), WVAL_ENCODING_MAP[v.type]]),
         ]);
+
+        const reifiedCode = /** @type {number[]} */ ([]);
+        for (const item of flatCode) {
+          if (typeof item === 'number') {
+            reifiedCode.push(item); // raw opcode
+            continue;
+          }
+          switch (item.kind) {
+            case "get":
+            case "set":
+            case "tee": {
+              const variable = item.variable;
+              const code =
+                (variable instanceof WLocal) ? (
+                  item.kind === "get" ? 0x20 :
+                  item.kind === "set" ? 0x21 :
+                  item.kind === "tee" ? 0x22 : -1) :
+                (variable instanceof WGlobal) ? (
+                  item.kind === "get" ? 0x23 :
+                  item.kind === "set" ? 0x24 : -1) : -1;
+              if (code === -1) {
+                throw new Error(
+                  `invalid variable get/set/tee combo ${
+                    JSON.stringify(item)}`);
+              }
+              if (variable.slotId < 0) {
+                throw new Error(
+                  `Variable used before slot assigned ${
+                    JSON.stringify(variable)}`);
+              }
+              reifiedCode.push(code, variable.slotId);
+              break;
+            }
+            default:
+              throw new Error(`Unrecognized item kind ${item.kind}`);
+          }
+        }
         const expr = [
-          CODE.i32.const(6789),
-          CODE.ret,
+          ...reifiedCode,
           0x0B,
         ];
-        const func = [locals, expr].flat(Infinity);
+        const func = [localsEncoded, expr].flat(Infinity);
         const code = [lebu(func.length), func];
         return code;
       }),
@@ -241,17 +411,38 @@
       ...typeSection, // 1
       ...importSection, // 2
       ...functionSection, // 3
+      ...globalSection, // 6
       ...exportSection, // 7
       ...codeSection, // 10
     ].flat(Infinity));
   }
 
   const wasmBytes = emit(b => {
+    const { CODE } = b;
+
+    const globalA = b.newGlobal(I32);
+
     const puti = b.newFunc();
     puti.import = ["c", "puti"];
 
     const func = b.newFunc();
-    func.export = "someFunc";
+    {
+      const localA = func.newLocal(I32);
+      func.export = "main";
+      func.code = [
+        CODE.i32.const(777), // A = 777
+        // CODE.tee(localA),
+        CODE.set(globalA),
+        CODE.get(globalA), // A + A
+        CODE.get(globalA),
+        CODE.i32.add,
+
+        // CODE.i32.const(555),
+        // CODE.i32.const(47),
+        // CODE.i32.add,
+        CODE.ret,
+      ];
+    }
   });
   WebAssembly.instantiate(wasmBytes, {
     c: {
@@ -262,7 +453,12 @@
   })
     .then(({ instance }) => {
       const { exports } = instance;
-      console.log(exports.someFunc());
+      if (exports.main) {
+        const returnValue = exports.main();
+        console.log('main returned', returnValue);
+      } else {
+        console.log('no main function found');
+      }
     })
     .catch(e => console.log('error', e));
 })();
